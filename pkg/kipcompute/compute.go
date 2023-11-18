@@ -343,7 +343,9 @@ func Kubeip(instance <-chan types.Instance, config *cfg.Config) {
 	for {
 		inst := <-instance
 		logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "Kubeip"}).Infof("Working on %s in zone %s", inst.Name, inst.Zone)
-		_ = replaceIP(inst.ProjectID, inst.Zone, inst.Name, inst.Pool, config)
+		if !IsInstanceUsesReservedIP(inst.ProjectID, inst.Name, inst.Zone, config) {
+			_ = replaceIP(inst.ProjectID, inst.Zone, inst.Name, inst.Pool, config)
+		}
 	}
 }
 
