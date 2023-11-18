@@ -259,7 +259,7 @@ func (c *Controller) processItem(newEvent Event) error {
 			node := newEvent.key[len(prefix):]
 			logrus.WithFields(logrus.Fields{"pkg": "kubeip-" + newEvent.resourceType, "function": "processItem"}).Infof("Processing removal to %v: %s ", newEvent.resourceType, node)
 			// A node has been deleted... we need to check whether the assignment is still optimal
-			c.forceAssignmentOnce(true)
+			c.forceAssignmentOnce(false)
 			return nil
 		}
 	case "create":
@@ -458,7 +458,7 @@ func (c *Controller) forceAssignmentOnce(shouldCheckOptimalIPAssignment bool) {
 
 func (c *Controller) forceAssignment() {
 	logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "forceAssignment"}).Info("Processing initial force assignment check")
-	c.forceAssignmentOnce(true)
+	c.forceAssignmentOnce(false)
 	for range c.ticker.C {
 		logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "forceAssignment"}).Info("Tick received for force assignment check")
 		c.forceAssignmentOnce(false)
