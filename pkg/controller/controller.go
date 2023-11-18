@@ -357,12 +357,12 @@ func (c *Controller) processAllNodes(shouldCheckOptimalIPAssignment bool) error 
 
 		// If node is not ready we will basically remove the node IP just in case
 		if !isNodeReady(node) {
-			logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "processAllNodes"}).Infof("Node %s in zone %s is not ready, removing IP so we can reuse it. ", inst.Name, inst.Zone)
-			// Delete the IP we will re-assign this
-			err = kipcompute.DeleteIP(c.projectID, inst.Zone, inst.Name, c.config)
-			if err != nil {
-				return errors.Wrap(err, "Can not delete IP")
-			}
+			//logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "processAllNodes"}).Infof("Node %s in zone %s is not ready, removing IP so we can reuse it. ", inst.Name, inst.Zone)
+			//// Delete the IP we will re-assign this
+			//err = kipcompute.DeleteIP(c.projectID, inst.Zone, inst.Name, c.config)
+			//if err != nil {
+			//	return errors.Wrap(err, "Can not delete IP")
+			//}
 			continue
 		}
 

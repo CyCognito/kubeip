@@ -55,7 +55,7 @@ func setConfigDefaults() {
 	viper.SetDefault("OrderByLabelKey", "priority")
 	viper.SetDefault("OrderByDesc", true)
 	viper.SetDefault("CopyLabels", true)
-	viper.SetDefault("ClearLabels", true)
+	viper.SetDefault("ClearLabels", false)
 	viper.SetDefault("DryRun", false)
 }
 
