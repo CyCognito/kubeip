@@ -90,9 +90,9 @@ spec:
                 name: "kubeip-config"
 
 
-
-          - name: GOOGLE_APPLICATION_CREDENTIALS
-            value: /var/secrets/google/key.json
+#  use workload identity
+#          - name: GOOGLE_APPLICATION_CREDENTIALS
+#            value: /var/secrets/google/key.json
         restartPolicy: Always
         serviceAccountName: kubeip-sa
         volumes:
@@ -106,6 +106,8 @@ kind: ServiceAccount
 metadata:
   name: kubeip-sa
   namespace: kube-system
+  annotations:
+    iam.gke.io/gcp-service-account: "" # put your service account here
 
 ---
 kind: ClusterRole

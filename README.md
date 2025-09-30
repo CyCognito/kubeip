@@ -275,14 +275,14 @@ gcloud iam roles create kubeip --project $PROJECT_ID --file roles.yaml
 gcloud projects add-iam-policy-binding $PROJECT_ID --member serviceAccount:kubeip-service-account@$PROJECT_ID.iam.gserviceaccount.com --role projects/$PROJECT_ID/roles/kubeip
 ```
 
-Generate the Key using the following command:
+Use workload identity or generate the Key using the following command:
 
 ```
 gcloud iam service-accounts keys create key.json \
   --iam-account kubeip-service-account@$PROJECT_ID.iam.gserviceaccount.com
 ```
 
-**Create Kubernetes Secret**
+**Create Kubernetes Secret - skip if using workload identity **
 
 Get your GKE cluster credentaials with (replace *cluster_name* with your real GKE cluster name):
 
@@ -292,7 +292,7 @@ gcloud container clusters get-credentials $GKE_CLUSTER_NAME \
     --project $PROJECT_ID
 ```
 
-Create a Kubernetes secret by running:
+Create a Kubernetes secret by running (skip if using workload identity):
 
 ```
 kubectl create secret generic kubeip-key --from-file=key.json -n kube-system
