@@ -81,7 +81,8 @@ var serverStartTime time.Time
 
 const maxRetries = 5
 
-const prefix = "kube-system/kube-proxy-"
+const kubeSystemNamespace = "kube-system"
+const prefix = kubeSystemNamespace + "/kube-proxy-"
 
 // Start kubeip controller
 func Start(config *cfg.Config) error {
@@ -97,10 +98,10 @@ func Start(config *cfg.Config) error {
 	informer := cache.NewSharedIndexInformer(
 		&cache.ListWatch{
 			ListFunc: func(options meta_v1.ListOptions) (runtime.Object, error) {
-				return kubeClient.CoreV1().Pods(meta_v1.NamespaceAll).List(context.Background(), options)
+				return kubeClient.CoreV1().Pods(kubeSystemNamespace).List(context.Background(), options)
 			},
 			WatchFunc: func(options meta_v1.ListOptions) (watch.Interface, error) {
-				return kubeClient.CoreV1().Pods(meta_v1.NamespaceAll).Watch(context.Background(), options)
+				return kubeClient.CoreV1().Pods(kubeSystemNamespace).Watch(context.Background(), options)
 			},
 		},
 		&api_v1.Pod{},
