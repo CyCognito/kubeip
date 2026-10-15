@@ -26,6 +26,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/compute/metadata"
@@ -45,9 +46,59 @@ func ClusterName() (string, error) {
 	return metadata.InstanceAttributeValue("cluster-name")
 }
 
+// ClusterLocation get GKE cluster location from metadata
+func ClusterLocation() (string, error) {
+	return metadata.InstanceAttributeValue("cluster-location")
+}
+
 // ProjectName get GCP project name from metadata
 func ProjectName() (string, error) {
 	return metadata.ProjectID()
+}
+
+var (
+	containerMu      sync.Mutex
+	containerService *container.Service
+)
+
+func getContainerService() (*container.Service, error) {
+	containerMu.Lock()
+	defer containerMu.Unlock()
+	if containerService != nil {
+		return containerService, nil
+	}
+	hc, err := google.DefaultClient(context.Background(), container.CloudPlatformScope)
+	if err != nil {
+		return nil, err
+	}
+	svc, err := container.New(hc)
+	if err != nil {
+		return nil, err
+	}
+	containerService = svc
+	return containerService, nil
+}
+
+// ListClusterNodePoolNames returns the node pool names on this cluster.
+// The names come from clusters.get, which is enough to turn a prefix rule into exact pools
+// without listing every Kubernetes node.
+func ListClusterNodePoolNames(projectID, location, cluster string) ([]string, error) {
+	containerService, err := getContainerService()
+	if err != nil {
+		return nil, err
+	}
+	name := fmt.Sprintf("projects/%s/locations/%s/clusters/%s", projectID, location, cluster)
+	got, err := containerService.Projects.Locations.Clusters.Get(name).Do()
+	if err != nil {
+		return nil, errors.Wrap(err, "can not get cluster")
+	}
+	names := make([]string, 0, len(got.NodePools))
+	for _, pool := range got.NodePools {
+		if pool != nil && pool.Name != "" {
+			names = append(names, pool.Name)
+		}
+	}
+	return names, nil
 }
 
 func getPriorityOrder(address *compute.Address, config *cfg.Config) int {
@@ -77,6 +128,18 @@ func GetAllAddresses(projectID string, region string, filterJustReserved bool, c
 	return getAllAddresses(projectID, region, config.NodePool, filterJustReserved, config)
 }
 
+func addressFilter(pool string, config *cfg.Config) (string, error) {
+	base := "(labels." + config.LabelKey + "=" + config.LabelValue + ")"
+	if config.AllNodePools || strings.EqualFold(pool, config.NodePool) {
+		return base + " AND  (-labels." + config.LabelKey + "-node-pool:*)", nil
+	}
+	tag, _, ok := config.MatchAdditionalPool(pool)
+	if !ok {
+		return "", fmt.Errorf("no additional node pool binding for pool %s", pool)
+	}
+	return base + " AND " + "(labels." + config.LabelKey + "-node-pool=" + tag + ")", nil
+}
+
 func getAllAddresses(projectID string, region string, pool string, filterJustReserved bool, config *cfg.Config) (*compute.AddressList, error) {
 	hc, err := google.DefaultClient(context.Background(), container.CloudPlatformScope)
 	if err != nil {
@@ -88,11 +151,10 @@ func getAllAddresses(projectID string, region string, pool string, filterJustRes
 		logrus.Error(err)
 		return nil, err
 	}
-	var filter string
-	if config.AllNodePools || strings.EqualFold(pool, config.NodePool) {
-		filter = "(labels." + config.LabelKey + "=" + config.LabelValue + ")" + " AND  (-labels." + config.LabelKey + "-node-pool:*)"
-	} else {
-		filter = "(labels." + config.LabelKey + "=" + config.LabelValue + ")" + " AND " + "(labels." + config.LabelKey + "-node-pool=" + pool + ")"
+	filter, err := addressFilter(pool, config)
+	if err != nil {
+		logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "getAllAddresses"}).Error(err)
+		return nil, err
 	}
 
 	var computedFilter string

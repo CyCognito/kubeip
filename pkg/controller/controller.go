@@ -57,16 +57,17 @@ type AddressInstanceTuple struct {
 
 // Controller object
 type Controller struct {
-	logger      *logrus.Entry
-	clientset   kubernetes.Interface
-	queue       workqueue.RateLimitingInterface
-	informer    cache.SharedIndexInformer
-	instance    chan<- types.Instance
-	projectID   string
-	clusterName string
-	config      *cfg.Config
-	ticker      *time.Ticker
-	processing  bool
+	logger          *logrus.Entry
+	clientset       kubernetes.Interface
+	queue           workqueue.RateLimitingInterface
+	informer        cache.SharedIndexInformer
+	instance        chan<- types.Instance
+	projectID       string
+	clusterName     string
+	clusterLocation string
+	config          *cfg.Config
+	ticker          *time.Ticker
+	processing      bool
 }
 
 // Event indicate the informerEvent
@@ -115,6 +116,10 @@ func Start(config *cfg.Config) error {
 	c.clusterName, err = kipcompute.ClusterName()
 	if err != nil {
 		return errors.Wrap(err, "Can not get cluster name")
+	}
+	c.clusterLocation, err = kipcompute.ClusterLocation()
+	if err != nil {
+		return errors.Wrap(err, "Can not get cluster location")
 	}
 	c.config = config
 	c.ticker = time.NewTicker(c.config.Ticker * time.Minute)
@@ -237,12 +242,8 @@ func (c *Controller) isNodePoolMonitored(pool string) bool {
 	if strings.EqualFold(pool, c.config.NodePool) {
 		return true
 	}
-	for _, ns := range c.config.AdditionalNodePools {
-		if strings.EqualFold(pool, ns) {
-			return true
-		}
-	}
-	return false
+	_, _, ok := c.config.MatchAdditionalPool(pool)
+	return ok
 }
 func (c *Controller) processItem(newEvent Event) error {
 	obj, _, err := c.informer.GetIndexer().GetByKey(newEvent.key)
@@ -328,7 +329,23 @@ func (c *Controller) processAllNodes(shouldCheckOptimalIPAssignment bool) error 
 		return errors.Wrap(err, "Can not get kubernetes API")
 	}
 	logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "processAllNodes"}).Info("Collecting Node List...")
-	nodelist, _ := kubeClient.CoreV1().Nodes().List(context.Background(), meta_v1.ListOptions{})
+	selector := "cloud.google.com/gke-nodepool"
+	if !c.config.AllNodePools {
+		pools, err := c.monitoredPoolNames()
+		if err != nil {
+			logrus.WithError(err).Error("Can not resolve prefix node pools")
+		}
+		if len(pools) == 0 {
+			return nil
+		}
+		selector = nodePoolInSelector(pools)
+	}
+	nodelist, err := kubeClient.CoreV1().Nodes().List(context.Background(), meta_v1.ListOptions{
+		LabelSelector: selector,
+	})
+	if err != nil {
+		return errors.Wrap(err, "Can not list nodes")
+	}
 	var pool string
 	var ok bool
 	var nodesOfInterest []types.Instance
@@ -466,37 +483,82 @@ func (c *Controller) forceAssignment() {
 }
 
 func (c *Controller) assignMissingTags() error {
-	nodePools := append(c.config.AdditionalNodePools, c.config.NodePool)
-
 	kubeClient, err := utils.GetClient()
 	if err != nil {
 		return errors.Wrap(err, "Can not get kubernetes API")
 	}
 
-	for _, pool := range nodePools {
-		label := fmt.Sprintf("!kubip_assigned,cloud.google.com/gke-nodepool=%s", pool)
-		nodelist, err := kubeClient.CoreV1().Nodes().List(context.Background(), meta_v1.ListOptions{
-			LabelSelector: label,
-		})
-		if err != nil {
-			logrus.Error(err)
+	pools, err := c.monitoredPoolNames()
+	if err != nil {
+		logrus.WithError(err).Error("Can not resolve prefix node pools")
+	}
+	if len(pools) == 0 {
+		return nil
+	}
+	nodelist, err := kubeClient.CoreV1().Nodes().List(context.Background(), meta_v1.ListOptions{
+		LabelSelector: "!kubip_assigned," + nodePoolInSelector(pools),
+	})
+	if err != nil {
+		logrus.Error(err)
+		return nil
+	}
+	c.tagNodesMissingAssignment(nodelist.Items)
+	return nil
+}
+
+// monitoredPoolNames is the exact pool names kubeip should list.
+// A prefix rule is expanded with the cluster's node pool names so the node list
+// can use an exact label selector instead of every node in the cluster.
+func (c *Controller) monitoredPoolNames() ([]string, error) {
+	var pools []string
+	if c.config.NodePool != "" {
+		pools = appendUnique(pools, c.config.NodePool)
+	}
+	wildcard := false
+	for _, binding := range c.config.AdditionalNodePools {
+		if binding.Wildcard {
+			wildcard = true
 			continue
-
 		}
-		for _, node := range nodelist.Items {
-			labels := node.GetLabels()
-			if nodeZone, ok := labels["failure-domain.beta.kubernetes.io/zone"]; ok {
-				if err != nil {
-					logrus.WithError(err).Error("Could not get node zone")
-					continue
-				}
-				logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "assignMissingTags"}).Infof("Found node without tag %s", node.GetName())
-				kipcompute.AddTagIfMissing(c.projectID, node.GetName(), nodeZone, c.config)
-
-			} else {
-				continue
-			}
+		pools = appendUnique(pools, binding.Selector)
+	}
+	if !wildcard {
+		return pools, nil
+	}
+	names, err := kipcompute.ListClusterNodePoolNames(c.projectID, c.clusterLocation, c.clusterName)
+	if err != nil {
+		return pools, err
+	}
+	for _, name := range names {
+		_, matchedWildcard, ok := c.config.MatchAdditionalPool(name)
+		if ok && matchedWildcard {
+			pools = appendUnique(pools, name)
 		}
 	}
-	return nil
+	return pools, nil
+}
+
+func nodePoolInSelector(pools []string) string {
+	return "cloud.google.com/gke-nodepool in (" + strings.Join(pools, ",") + ")"
+}
+
+func appendUnique(pools []string, name string) []string {
+	for _, existing := range pools {
+		if existing == name {
+			return pools
+		}
+	}
+	return append(pools, name)
+}
+
+func (c *Controller) tagNodesMissingAssignment(nodes []api_v1.Node) {
+	for _, node := range nodes {
+		labels := node.GetLabels()
+		nodeZone, ok := labels["failure-domain.beta.kubernetes.io/zone"]
+		if !ok {
+			continue
+		}
+		logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "assignMissingTags"}).Infof("Found node without tag %s", node.GetName())
+		kipcompute.AddTagIfMissing(c.projectID, node.GetName(), nodeZone, c.config)
+	}
 }
