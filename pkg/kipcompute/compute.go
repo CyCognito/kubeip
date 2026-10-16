@@ -406,7 +406,17 @@ func Kubeip(instance <-chan types.Instance, config *cfg.Config) {
 		inst := <-instance
 		logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "Kubeip"}).Infof("Working on %s in zone %s", inst.Name, inst.Zone)
 		if !IsInstanceUsesReservedIP(inst.ProjectID, inst.Name, inst.Zone, config) {
-			_ = replaceIP(inst.ProjectID, inst.Zone, inst.Name, inst.Pool, config)
+			err := replaceIP(inst.ProjectID, inst.Zone, inst.Name, inst.Pool, config)
+			if err != nil {
+				logrus.WithError(err).Errorf("can not replace IP for %s", inst.Name)
+				if cordonErr := utils.CordonNode(inst.Name, config); cordonErr != nil {
+					logrus.WithError(cordonErr).Errorf("can not cordon node %s", inst.Name)
+				}
+				continue
+			}
+			if uncordonErr := utils.UncordonNode(inst.Name, config); uncordonErr != nil {
+				logrus.WithError(uncordonErr).Errorf("can not uncordon node %s", inst.Name)
+			}
 		}
 	}
 }

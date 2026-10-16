@@ -179,6 +179,56 @@ func TagNode(node string, ip types.IPAddress, config *cfg.Config) error {
 	return nil
 }
 
+const kubeipCordonLabel = "kubeip-cordoned"
+
+// CordonNode marks the node unschedulable so new pods are not placed on it.
+func CordonNode(node string, config *cfg.Config) error {
+	return patchSchedulable(node, config, true)
+}
+
+// UncordonNode makes the node schedulable again when kubeip cordoned it.
+func UncordonNode(node string, config *cfg.Config) error {
+	kubeClient, err := GetClient()
+	if err != nil {
+		return errors.Wrap(err, "Can not get kubernetes API")
+	}
+	current, err := kubeClient.CoreV1().Nodes().Get(context.Background(), node, metav1.GetOptions{})
+	if err != nil {
+		return errors.Wrap(err, "Can not get node")
+	}
+	if current.Labels[kubeipCordonLabel] != "true" {
+		return nil
+	}
+	return patchSchedulable(node, config, false)
+}
+
+func patchSchedulable(node string, config *cfg.Config, unschedulable bool) error {
+	kubeClient, err := GetClient()
+	if err != nil {
+		return errors.Wrap(err, "Can not get kubernetes API")
+	}
+	labelValue := `"true"`
+	if !unschedulable {
+		labelValue = "null"
+	}
+	patch := fmt.Sprintf(`{"metadata":{"labels":{"%s":%s}},"spec":{"unschedulable":%t}}`, kubeipCordonLabel, labelValue, unschedulable)
+	action := "Cordoned"
+	if !unschedulable {
+		action = "Uncordoned"
+	}
+	fields := logrus.Fields{"pkg": "kubeip", "function": "patchSchedulable"}
+	if config.DryRun {
+		logrus.WithFields(fields).Infof("Dry run: would have %s node %s", strings.ToLower(action), node)
+		return nil
+	}
+	_, err = kubeClient.CoreV1().Nodes().Patch(context.Background(), node, typesv1.MergePatchType, []byte(patch), metav1.PatchOptions{})
+	if err != nil {
+		return errors.Wrap(err, "Can not patch node")
+	}
+	logrus.WithFields(fields).Infof("%s node %s", action, node)
+	return nil
+}
+
 // GetNodeByIP get GKE node by IP
 func GetNodeByIP(ip string) (string, error) {
 	kubeClient, err := GetClient()
