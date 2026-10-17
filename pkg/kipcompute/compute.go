@@ -155,6 +155,19 @@ func addressFilter(pool string, config *cfg.Config) (string, error) {
 	return base + " AND " + "(labels." + config.LabelKey + "-node-pool=" + tag + ")", nil
 }
 
+// listAllAddresses returns every address matching filter. Compute returns at most 500 per page.
+func listAllAddresses(svc *compute.Service, projectID, region, filter string) ([]*compute.Address, error) {
+	var items []*compute.Address
+	err := svc.Addresses.List(projectID, region).Filter(filter).Pages(context.Background(), func(page *compute.AddressList) error {
+		items = append(items, page.Items...)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 func getAllAddresses(projectID string, region string, pool string, filterJustReserved bool, config *cfg.Config) (*compute.AddressList, error) {
 	computeService, err := getComputeService()
 	if err != nil {
@@ -174,13 +187,12 @@ func getAllAddresses(projectID string, region string, pool string, filterJustRes
 		computedFilter = filter
 	}
 
-	var addresses *compute.AddressList
-	addresses, err = computeService.Addresses.List(projectID, region).Filter(computedFilter).Do()
-
+	items, err := listAllAddresses(computeService, projectID, region, computedFilter)
 	if err != nil {
 		logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "getAllAddresses"}).Errorf("Failed to list IP addresses: %q", err)
 		return nil, err
 	}
+	addresses := &compute.AddressList{Items: items}
 
 	// Right now the SDK does not support filter and order together, so we do it programmatically.
 	sort.SliceStable(addresses.Items, func(i, j int) bool {
@@ -343,13 +355,13 @@ func GetAddressUsedByInstance(projectID string, instance string, zone string, co
 
 	region := zone[:len(zone)-2]
 	filter := "(labels." + config.LabelKey + "=" + config.LabelValue + ")"
-	addresses, err := computeService.Addresses.List(projectID, region).Filter(filter).Do()
+	addresses, err := listAllAddresses(computeService, projectID, region, filter)
 	if err != nil {
 		logrus.Fatalf("Could not list addresses for instance %s: %v", instance, err)
 		return "", err
 	}
 
-	for _, addr := range addresses.Items {
+	for _, addr := range addresses {
 		if len(addr.Users) > 0 && strings.Contains(addr.Users[0], instance) {
 			return addr.Address, nil
 		}
@@ -367,13 +379,13 @@ func IsInstanceUsesReservedIP(projectID string, instance string, zone string, co
 	}
 	region := zone[:len(zone)-2]
 	filter := "(labels." + config.LabelKey + "=" + config.LabelValue + ")"
-	addresses, err := svc.Addresses.List(projectID, region).Filter("(status=IN_USE) AND " + filter).Do()
+	addresses, err := listAllAddresses(svc, projectID, region, "(status=IN_USE) AND "+filter)
 	if err != nil {
 		logrus.Error(err)
 		return false
 	}
 
-	for _, addr := range addresses.Items {
+	for _, addr := range addresses {
 		if strings.Contains(addr.Users[0], instance) {
 			return true
 		}
@@ -410,14 +422,14 @@ func getAddressDetails(ip string, region string, projectID string, config *cfg.C
 	}
 	filter := "address=" + "\"" + ip + "\""
 
-	addresses, err := computeService.Addresses.List(projectID, region).Filter(filter).Do()
+	addresses, err := listAllAddresses(computeService, projectID, region, filter)
 	if err != nil {
 		logrus.Error(err)
 		return types.IPAddress{IP: "", Labels: map[string]string{}}, err
 	}
 
-	if len(addresses.Items) != 1 {
-		address := addresses.Items[0]
+	if len(addresses) != 1 {
+		address := addresses[0]
 		logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "getAddressDetails"}).Infof("Node ip is reserved %s %s", ip, fmt.Sprint(address.Labels))
 		return types.IPAddress{IP: address.Address, Labels: address.Labels}, nil
 	}
@@ -433,13 +445,13 @@ func isAddressReserved(ip string, region string, projectID string, config *cfg.C
 		return false
 	}
 	filter := "address=" + "\"" + ip + "\""
-	addresses, err := computeService.Addresses.List(projectID, region).Filter(filter).Do()
+	addresses, err := listAllAddresses(computeService, projectID, region, filter)
 	if err != nil {
 		logrus.Error(err)
 		return false
 	}
 
-	if len(addresses.Items) != 0 {
+	if len(addresses) != 0 {
 		logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "isAddressReserved"}).Infof("Node ip is reserved %s", ip)
 		return true
 	}

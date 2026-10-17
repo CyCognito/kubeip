@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -67,7 +68,7 @@ type Controller struct {
 	clusterLocation string
 	config          *cfg.Config
 	ticker          *time.Ticker
-	processing      bool
+	assignmentMu    sync.Mutex
 }
 
 // Event indicate the informerEvent
@@ -168,11 +169,10 @@ func newResourceController(client kubernetes.Interface, informer cache.SharedInd
 	})
 
 	return &Controller{
-		logger:     logrus.WithField("pkg", "kubeip-"+resourceType),
-		clientset:  client,
-		informer:   informer,
-		queue:      queue,
-		processing: false,
+		logger:    logrus.WithField("pkg", "kubeip-"+resourceType),
+		clientset: client,
+		informer:  informer,
+		queue:     queue,
 	}
 }
 
@@ -461,17 +461,16 @@ func (c *Controller) processAllNodes(shouldCheckOptimalIPAssignment bool) error 
 }
 
 func (c *Controller) forceAssignmentOnce(shouldCheckOptimalIPAssignment bool) {
-	if !c.processing {
-		c.processing = true
-		if c.config.ForceAssignment {
-			logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "forceAssignmentOnce"}).Info("Starting forceAssignmentOnce")
-			c.processAllNodes(shouldCheckOptimalIPAssignment)
-		}
-		c.assignMissingTags()
-		c.processing = false
-	} else {
+	if !c.assignmentMu.TryLock() {
 		logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "forceAssignmentOnce"}).Info("Skipping forceAssignmentOnce ... already in progress")
+		return
 	}
+	defer c.assignmentMu.Unlock()
+	if c.config.ForceAssignment {
+		logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "forceAssignmentOnce"}).Info("Starting forceAssignmentOnce")
+		c.processAllNodes(shouldCheckOptimalIPAssignment)
+	}
+	c.assignMissingTags()
 }
 
 func (c *Controller) forceAssignment() {
