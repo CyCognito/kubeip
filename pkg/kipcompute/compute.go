@@ -23,6 +23,7 @@ package kipcompute
 import (
 	"fmt"
 	"math"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,6 +39,7 @@ import (
 	"golang.org/x/net/context"
 	"google.golang.org/api/compute/v0.beta"
 	"google.golang.org/api/container/v1"
+	"google.golang.org/api/googleapi"
 )
 
 // ClusterName get GKE cluster name from metadata
@@ -325,24 +327,77 @@ func replaceIP(projectID string, zone string, instance string, pool string, conf
 
 }
 
-func waitForCompilation(projectID string, zone string, operation *compute.Operation) (err error) {
+const (
+	operationPollInterval = 2 * time.Second
+	operationHTTPRetries  = 5
+)
+
+func waitForCompilation(projectID string, zone string, operation *compute.Operation) error {
 	computeService, err := getComputeService()
 	if err != nil {
 		logrus.Fatalf("Could not get create compute service: %v", err)
 		return err
 	}
+	httpRetries := 0
 	for {
 		op, err := computeService.ZoneOperations.Get(projectID, zone, operation.Name).Do()
 		if err != nil {
-			logrus.Errorf("ZoneOperations.Get %q %s", err, operation.Name)
-			return err
+			if httpRetries >= operationHTTPRetries || !retryableOperationHTTPError(err) {
+				logrus.Errorf("ZoneOperations.Get %q %s", err, operation.Name)
+				return err
+			}
+			httpRetries++
+			delay := operationPollInterval << (httpRetries - 1)
+			logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "waitForCompilation"}).Warnf("ZoneOperations.Get %s: %v; retry %d/%d in %s", operation.Name, err, httpRetries, operationHTTPRetries, delay)
+			time.Sleep(delay)
+			continue
 		}
+		httpRetries = 0
 		if strings.ToLower(op.Status) != "done" {
-			time.Sleep(2 * time.Second)
-		} else {
-			return nil
+			time.Sleep(operationPollInterval)
+			continue
+		}
+		if opErr := operationError(op); opErr != nil {
+			logrus.Errorf("Operation %s failed: %v", operation.Name, opErr)
+			return opErr
+		}
+		return nil
+	}
+}
+
+func retryableOperationHTTPError(err error) bool {
+	apiErr, ok := errors.Cause(err).(*googleapi.Error)
+	if !ok {
+		return true
+	}
+	switch apiErr.Code {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func operationError(op *compute.Operation) error {
+	if op.Error != nil {
+		parts := make([]string, 0, len(op.Error.Errors))
+		for _, item := range op.Error.Errors {
+			if item == nil {
+				continue
+			}
+			msg := strings.TrimSpace(item.Code + " " + item.Message)
+			if msg != "" {
+				parts = append(parts, msg)
+			}
+		}
+		if len(parts) > 0 {
+			return fmt.Errorf("operation %s failed: %s", op.Name, strings.Join(parts, "; "))
 		}
 	}
+	if op.HttpErrorStatusCode != 0 {
+		return fmt.Errorf("operation %s failed: %d %s", op.Name, op.HttpErrorStatusCode, op.HttpErrorMessage)
+	}
+	return nil
 }
 
 // GetAddressUsedByInstance returns the IP used by this instance or the broadcast address otherwise.
