@@ -36,7 +36,6 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
-	"golang.org/x/oauth2/google"
 	"google.golang.org/api/compute/v0.beta"
 	"google.golang.org/api/container/v1"
 )
@@ -59,6 +58,8 @@ func ProjectName() (string, error) {
 var (
 	containerMu      sync.Mutex
 	containerService *container.Service
+	computeMu        sync.Mutex
+	computeService   *compute.Service
 )
 
 func getContainerService() (*container.Service, error) {
@@ -67,16 +68,26 @@ func getContainerService() (*container.Service, error) {
 	if containerService != nil {
 		return containerService, nil
 	}
-	hc, err := google.DefaultClient(context.Background(), container.CloudPlatformScope)
-	if err != nil {
-		return nil, err
-	}
-	svc, err := container.New(hc)
+	svc, err := container.NewService(context.Background())
 	if err != nil {
 		return nil, err
 	}
 	containerService = svc
 	return containerService, nil
+}
+
+func getComputeService() (*compute.Service, error) {
+	computeMu.Lock()
+	defer computeMu.Unlock()
+	if computeService != nil {
+		return computeService, nil
+	}
+	svc, err := compute.NewService(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	computeService = svc
+	return computeService, nil
 }
 
 // ListClusterNodePoolNames returns the node pool names on this cluster.
@@ -145,12 +156,7 @@ func addressFilter(pool string, config *cfg.Config) (string, error) {
 }
 
 func getAllAddresses(projectID string, region string, pool string, filterJustReserved bool, config *cfg.Config) (*compute.AddressList, error) {
-	hc, err := google.DefaultClient(context.Background(), container.CloudPlatformScope)
-	if err != nil {
-		logrus.Error(err)
-		return nil, err
-	}
-	computeService, err := compute.New(hc)
+	computeService, err := getComputeService()
 	if err != nil {
 		logrus.Error(err)
 		return nil, err
@@ -208,15 +214,9 @@ func findFreeAddress(projectID string, region string, pool string, config *cfg.C
 
 // DeleteIP delete current IP on GKE node
 func DeleteIP(projectID string, zone string, instance string, config *cfg.Config) error {
-	hc, err := google.DefaultClient(context.Background(), container.CloudPlatformScope)
+	computeService, err := getComputeService()
 	if err != nil {
 		logrus.Fatalf("Could not get authenticated client: %v", err)
-	}
-
-	computeService, err := compute.New(hc)
-	if err != nil {
-		logrus.Infof(err.Error())
-		return err
 	}
 	inst, err := computeService.Instances.Get(projectID, zone, instance).Do()
 	if err != nil {
@@ -247,15 +247,9 @@ func DeleteIP(projectID string, zone string, instance string, config *cfg.Config
 }
 
 func addIP(projectID string, zone string, instance string, pool string, addr types.IPAddress, config *cfg.Config) error {
-	hc, err := google.DefaultClient(context.Background(), container.CloudPlatformScope)
+	computeService, err := getComputeService()
 	if err != nil {
 		logrus.Fatalf("Could not get authenticated client: %v", err)
-	}
-
-	computeService, err := compute.New(hc)
-	if err != nil {
-		logrus.Infof(err.Error())
-		return err
 	}
 
 	if config.DryRun {
@@ -320,12 +314,7 @@ func replaceIP(projectID string, zone string, instance string, pool string, conf
 }
 
 func waitForCompilation(projectID string, zone string, operation *compute.Operation) (err error) {
-	hc, err := google.DefaultClient(context.Background(), container.CloudPlatformScope)
-	if err != nil {
-		logrus.Fatalf("Could not get authenticated client: %v", err)
-		return err
-	}
-	computeService, err := compute.New(hc)
+	computeService, err := getComputeService()
 	if err != nil {
 		logrus.Fatalf("Could not get create compute service: %v", err)
 		return err
@@ -346,13 +335,7 @@ func waitForCompilation(projectID string, zone string, operation *compute.Operat
 
 // GetAddressUsedByInstance returns the IP used by this instance or the broadcast address otherwise.
 func GetAddressUsedByInstance(projectID string, instance string, zone string, config *cfg.Config) (string, error) {
-	hc, err := google.DefaultClient(context.Background(), container.CloudPlatformScope)
-	if err != nil {
-		logrus.Fatalf("Could not get authenticated client: %v", err)
-		return "", err
-	}
-
-	computeService, err := compute.New(hc)
+	computeService, err := getComputeService()
 	if err != nil {
 		logrus.Fatalf("Could not get create compute service: %v", err)
 		return "", err
@@ -377,20 +360,14 @@ func GetAddressUsedByInstance(projectID string, instance string, zone string, co
 
 // IsInstanceUsesReservedIP test if GKE node is using reserved IP
 func IsInstanceUsesReservedIP(projectID string, instance string, zone string, config *cfg.Config) bool {
-	ctx := context.Background()
-	hc, err := google.DefaultClient(ctx, container.CloudPlatformScope)
-	if err != nil {
-		logrus.Error(err)
-		return false
-	}
-	computeService, err := compute.New(hc)
+	svc, err := getComputeService()
 	if err != nil {
 		logrus.Error(err)
 		return false
 	}
 	region := zone[:len(zone)-2]
 	filter := "(labels." + config.LabelKey + "=" + config.LabelValue + ")"
-	addresses, err := computeService.Addresses.List(projectID, region).Filter("(status=IN_USE) AND " + filter).Do()
+	addresses, err := svc.Addresses.List(projectID, region).Filter("(status=IN_USE) AND " + filter).Do()
 	if err != nil {
 		logrus.Error(err)
 		return false
@@ -426,12 +403,7 @@ func Kubeip(instance <-chan types.Instance, config *cfg.Config) {
 }
 
 func getAddressDetails(ip string, region string, projectID string, config *cfg.Config) (types.IPAddress, error) {
-	hc, err := google.DefaultClient(context.Background(), container.CloudPlatformScope)
-	if err != nil {
-		logrus.Error(err)
-		return types.IPAddress{IP: "", Labels: map[string]string{}}, err
-	}
-	computeService, err := compute.New(hc)
+	computeService, err := getComputeService()
 	if err != nil {
 		logrus.Error(err)
 		return types.IPAddress{IP: "", Labels: map[string]string{}}, err
@@ -455,12 +427,7 @@ func getAddressDetails(ip string, region string, projectID string, config *cfg.C
 }
 
 func isAddressReserved(ip string, region string, projectID string, config *cfg.Config) bool {
-	hc, err := google.DefaultClient(context.Background(), container.CloudPlatformScope)
-	if err != nil {
-		logrus.Error(err)
-		return false
-	}
-	computeService, err := compute.New(hc)
+	computeService, err := getComputeService()
 	if err != nil {
 		logrus.Error(err)
 		return false
@@ -481,13 +448,9 @@ func isAddressReserved(ip string, region string, projectID string, config *cfg.C
 
 // AddTagIfMissing add GKE node tag if missing
 func AddTagIfMissing(projectID string, instance string, zone string, config *cfg.Config) {
-	hc, err := google.DefaultClient(context.Background(), container.CloudPlatformScope)
+	computeService, err := getComputeService()
 	if err != nil {
 		logrus.Fatalf("Could not get authenticated client: %v", err)
-		return
-	}
-	computeService, err := compute.New(hc)
-	if err != nil {
 		return
 	}
 	inst, err := computeService.Instances.Get(projectID, zone, instance).Do()
