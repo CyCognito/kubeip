@@ -370,27 +370,46 @@ func GetAddressUsedByInstance(projectID string, instance string, zone string, co
 	return "0.0.0.0", nil
 }
 
-// IsInstanceUsesReservedIP test if GKE node is using reserved IP
-func IsInstanceUsesReservedIP(projectID string, instance string, zone string, config *cfg.Config) bool {
+// ListInUseReservedAddressResources returns the resource URLs attached to in-use kubeip addresses in one region.
+func ListInUseReservedAddressResources(projectID string, region string, config *cfg.Config) ([]string, error) {
 	svc, err := getComputeService()
 	if err != nil {
-		logrus.Error(err)
-		return false
+		return nil, err
 	}
-	region := zone[:len(zone)-2]
-	filter := "(labels." + config.LabelKey + "=" + config.LabelValue + ")"
-	addresses, err := listAllAddresses(svc, projectID, region, "(status=IN_USE) AND "+filter)
+	filter := "(status=IN_USE) AND (labels." + config.LabelKey + "=" + config.LabelValue + ")"
+	addresses, err := listAllAddresses(svc, projectID, region, filter)
 	if err != nil {
-		logrus.Error(err)
-		return false
+		return nil, err
 	}
-
+	resources := make([]string, 0, len(addresses))
 	for _, addr := range addresses {
-		if strings.Contains(addr.Users[0], instance) {
+		if len(addr.Users) == 0 {
+			continue
+		}
+		resources = append(resources, addr.Users[0])
+	}
+	return resources, nil
+}
+
+// InstanceOnReservedAddress reports whether instance appears in one of the reserved-address resource URLs.
+func InstanceOnReservedAddress(resources []string, instance string) bool {
+	for _, resource := range resources {
+		if strings.Contains(resource, instance) {
 			return true
 		}
 	}
 	return false
+}
+
+// IsInstanceUsesReservedIP reports whether the GKE node is using a reserved IP.
+// A list failure is returned as an error so the caller does not treat it as "no reserved IP".
+func IsInstanceUsesReservedIP(projectID string, instance string, zone string, config *cfg.Config) (bool, error) {
+	region := zone[:len(zone)-2]
+	resources, err := ListInUseReservedAddressResources(projectID, region, config)
+	if err != nil {
+		return false, err
+	}
+	return InstanceOnReservedAddress(resources, instance), nil
 }
 
 // Kubeip replace GKE node IP
@@ -398,7 +417,12 @@ func Kubeip(instance <-chan types.Instance, config *cfg.Config) {
 	for {
 		inst := <-instance
 		logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "Kubeip"}).Infof("Working on %s in zone %s", inst.Name, inst.Zone)
-		if !IsInstanceUsesReservedIP(inst.ProjectID, inst.Name, inst.Zone, config) {
+		usesReserved, err := IsInstanceUsesReservedIP(inst.ProjectID, inst.Name, inst.Zone, config)
+		if err != nil {
+			logrus.WithError(err).Errorf("can not check reserved IP for %s", inst.Name)
+			continue
+		}
+		if !usesReserved {
 			err := replaceIP(inst.ProjectID, inst.Zone, inst.Name, inst.Pool, config)
 			if err != nil {
 				logrus.WithError(err).Errorf("can not replace IP for %s", inst.Name)
@@ -428,14 +452,14 @@ func getAddressDetails(ip string, region string, projectID string, config *cfg.C
 		return types.IPAddress{IP: "", Labels: map[string]string{}}, err
 	}
 
-	if len(addresses) != 1 {
+	if len(addresses) == 1 {
 		address := addresses[0]
 		logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "getAddressDetails"}).Infof("Node ip is reserved %s %s", ip, fmt.Sprint(address.Labels))
 		return types.IPAddress{IP: address.Address, Labels: address.Labels}, nil
 	}
 
-	logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "getAddressDetails"}).Errorf("More than one address found %s", ip)
-	return types.IPAddress{IP: "", Labels: map[string]string{}}, fmt.Errorf("more than one address found for ip %s", ip)
+	logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "getAddressDetails"}).Errorf("%d addresses returned for ip %s", len(addresses), ip)
+	return types.IPAddress{IP: "", Labels: map[string]string{}}, fmt.Errorf("%d addresses returned for ip %s", len(addresses), ip)
 }
 
 func isAddressReserved(ip string, region string, projectID string, config *cfg.Config) bool {

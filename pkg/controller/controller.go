@@ -451,11 +451,34 @@ func (c *Controller) processAllNodes(shouldCheckOptimalIPAssignment bool) error 
 		}
 	}
 
+	resourcesByRegion := map[string][]string{}
+	failedRegions := map[string]struct{}{}
 	for _, inst := range nodesOfInterest {
-		if !kipcompute.IsInstanceUsesReservedIP(c.projectID, inst.Name, inst.Zone, c.config) {
-			logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "processAllNodes"}).Infof("Found unassigned node %s in pool %s", inst.Name, inst.Pool)
-			c.instance <- inst
+		region := inst.Zone[:len(inst.Zone)-2]
+		if _, seen := resourcesByRegion[region]; seen {
+			continue
 		}
+		if _, failed := failedRegions[region]; failed {
+			continue
+		}
+		resources, err := kipcompute.ListInUseReservedAddressResources(c.projectID, region, c.config)
+		if err != nil {
+			logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "processAllNodes"}).Errorf("Can not list in-use reserved IPs in region %s: %v", region, err)
+			failedRegions[region] = struct{}{}
+			continue
+		}
+		resourcesByRegion[region] = resources
+	}
+	for _, inst := range nodesOfInterest {
+		region := inst.Zone[:len(inst.Zone)-2]
+		if _, failed := failedRegions[region]; failed {
+			continue
+		}
+		if kipcompute.InstanceOnReservedAddress(resourcesByRegion[region], inst.Name) {
+			continue
+		}
+		logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "processAllNodes"}).Infof("Found unassigned node %s in pool %s", inst.Name, inst.Pool)
+		c.instance <- inst
 	}
 	return nil
 }
