@@ -21,6 +21,7 @@
 package kipcompute
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"net/http"
@@ -36,7 +37,6 @@ import (
 	"github.com/doitintl/kubeip/pkg/utils"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/net/context"
 	"google.golang.org/api/compute/v0.beta"
 	"google.golang.org/api/container/v1"
 	"google.golang.org/api/googleapi"
@@ -130,7 +130,7 @@ func getPriorityOrder(address *compute.Address, config *cfg.Config) int {
 	if ok {
 		intVal, err := strconv.Atoi(strVal)
 		if err != nil {
-			logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "getPriorityOrder"}).Errorf("Address %s has errors. Failed to convert order by label value %s with value %s to integer", address.Name, config.OrderByLabelKey, strVal, err)
+			logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "getPriorityOrder"}).Errorf("Address %s has errors. Failed to convert order by label value %s with value %s to integer: %v", address.Name, config.OrderByLabelKey, strVal, err)
 			return defaultValue
 		}
 		return intVal

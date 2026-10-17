@@ -21,6 +21,7 @@
 package controller
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/signal"
@@ -37,7 +38,6 @@ import (
 	"github.com/doitintl/kubeip/pkg/types"
 	"github.com/doitintl/kubeip/pkg/utils"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/net/context"
 	api_v1 "k8s.io/api/core/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"

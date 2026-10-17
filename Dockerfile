@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM golang:1.20-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS builder
 # curl git bash
 RUN apk add --no-cache curl git bash make
 
