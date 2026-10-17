@@ -334,7 +334,7 @@ func (c *Controller) processAllNodes(shouldCheckOptimalIPAssignment bool) error 
 	if !c.config.AllNodePools {
 		pools, err := c.monitoredPoolNames()
 		if err != nil {
-			logrus.WithError(err).Error("Can not resolve prefix node pools")
+			logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "processAllNodes"}).Errorf("Can not read cluster node pools: %v", err)
 		}
 		if len(pools) == 0 {
 			return nil
@@ -491,7 +491,7 @@ func (c *Controller) assignMissingTags() error {
 
 	pools, err := c.monitoredPoolNames()
 	if err != nil {
-		logrus.WithError(err).Error("Can not resolve prefix node pools")
+		logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "assignMissingTags"}).Errorf("Can not read cluster node pools: %v", err)
 	}
 	if len(pools) == 0 {
 		return nil

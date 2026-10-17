@@ -85,12 +85,12 @@ func getContainerService() (*container.Service, error) {
 func ListClusterNodePoolNames(projectID, location, cluster string) ([]string, error) {
 	containerService, err := getContainerService()
 	if err != nil {
-		return nil, err
+		return nil, readNodePoolsError(projectID, location, cluster, err)
 	}
 	name := fmt.Sprintf("projects/%s/locations/%s/clusters/%s", projectID, location, cluster)
 	got, err := containerService.Projects.Locations.Clusters.Get(name).Do()
 	if err != nil {
-		return nil, errors.Wrap(err, "can not get cluster")
+		return nil, readNodePoolsError(projectID, location, cluster, err)
 	}
 	names := make([]string, 0, len(got.NodePools))
 	for _, pool := range got.NodePools {
@@ -99,6 +99,10 @@ func ListClusterNodePoolNames(projectID, location, cluster string) ([]string, er
 		}
 	}
 	return names, nil
+}
+
+func readNodePoolsError(projectID, location, cluster string, err error) error {
+	return errors.Wrapf(err, "can not read node pools for cluster %s in %s project %s", cluster, location, projectID)
 }
 
 func getPriorityOrder(address *compute.Address, config *cfg.Config) int {
