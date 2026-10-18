@@ -1,0 +1,37 @@
+app:
+  name: kubeip
+
+image: doitintl/kubeip
+tag: latest
+imagePullPolicy: Always
+
+replicas: 1
+
+# Pods run on this pool. Keep it different from env.KUBEIP_NODEPOOL.
+priorityClassName: system-cluster-critical
+nodeSelector:
+  cloud.google.com/gke-nodepool: pool-kubip
+
+serviceaccount:
+  name: kubeip-sa
+
+# Required Google service account email for Workload Identity. The account id
+# (before @) must be 30 characters or fewer. kubeip-service-account is 22.
+# Example: kubeip-service-account@my-project.iam.gserviceaccount.com
+gsa_name: ""
+
+resources: {}
+
+env:
+  KUBEIP_LABELKEY: kubeip
+  KUBEIP_LABELVALUE: reserved
+  KUBEIP_NODEPOOL: default-pool
+  KUBEIP_FORCEASSIGNMENT: "true"
+  KUBEIP_ADDITIONALNODEPOOLS: ""
+  KUBEIP_TICKER: "5"
+  KUBEIP_ALLNODEPOOLS: "false"
+  KUBEIP_ORDERBYLABELKEY: priority
+  KUBEIP_ORDERBYDESC: "true"
+  KUBEIP_COPYLABELS: "false"
+  KUBEIP_CLEARLABELS: "false"
+  KUBEIP_DRYRUN: "false"

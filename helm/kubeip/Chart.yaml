@@ -1,0 +1,6 @@
+apiVersion: v2
+name: kubeip
+description: Assign reserved Google Cloud addresses to GKE nodes
+type: application
+version: 0.1.0
+appVersion: latest

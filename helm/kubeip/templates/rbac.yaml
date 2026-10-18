@@ -1,0 +1,53 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Values.serviceaccount.name }}
+  labels:
+    app: {{ .Values.app.name }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Values.serviceaccount.name }}
+  labels:
+    app: {{ .Values.app.name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Values.serviceaccount.name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.serviceaccount.name }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Values.serviceaccount.name }}
+  namespace: kube-system
+  labels:
+    app: {{ .Values.app.name }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Values.serviceaccount.name }}
+  namespace: kube-system
+  labels:
+    app: {{ .Values.app.name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Values.serviceaccount.name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.serviceaccount.name }}
+    namespace: {{ .Release.Namespace }}

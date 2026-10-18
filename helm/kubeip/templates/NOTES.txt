@@ -1,0 +1,8 @@
+kubeIP is installed in {{ .Release.Namespace }}.
+
+Workload Identity uses {{ .Values.gsa_name }}.
+The chart does not mount a service account key.
+
+Reserved addresses should be labeled {{ .Values.env.KUBEIP_LABELKEY }}={{ .Values.env.KUBEIP_LABELVALUE }}.
+{{ .Values.env.KUBEIP_NODEPOOL }} is the pool those addresses are assigned to.
+The kubeIP pod itself selects {{ .Values.nodeSelector }}.

@@ -6,7 +6,7 @@ Many applications need to be whitelisted by users based on a Source IP Address. 
 
 # Deploy kubeIP (without building from source)
 
-If you just want to use kubeIP (instead of building it yourself from source), please follow the instructions in this section. You’ll need Kubernetes version 1.10 or newer. You'll also need the Google Cloud SDK. You can install the [Google Cloud SDK](https://cloud.google.com/sdk) (which also installs kubectl).
+If you just want to use kubeIP (instead of building it yourself from source), please follow the instructions in this section. You’ll need Kubernetes version 1.10 or newer, Helm 3 or newer, and the Google Cloud SDK. You can install the [Google Cloud SDK](https://cloud.google.com/sdk) (which also installs kubectl).
 
 To configure your Google Cloud SDK, set default project as:
 
@@ -63,22 +63,15 @@ gcloud projects add-iam-policy-binding $PROJECT_ID \
     --condition=None
 ```
 
-**Getting credentials to the deployment**
+**Allow the Kubernetes service account to use the Google service account**
 
-Note: If you use Workload Identity in your cluster, you do not need to upload a credential file.
-You can just remove the GOOGLE_APPLICATION_CREDENTIALS environment variable from the manifest
-and the Google Cloud SDK will pick up the credentials from the metadata server as per normal
-operation.
+kubeIP uses Workload Identity. The chart annotates the `kubeip-sa` service account in `kube-system` and does not mount a key file.
 
-Generate the Key using the following command:
 ```
-gcloud iam service-accounts keys create key.json \
-    --iam-account kubeip-service-account@$PROJECT_ID.iam.gserviceaccount.com
-```
-
-Create a Kubernetes secret object by running:
-```
-kubectl create secret generic kubeip-key --from-file=key.json -n kube-system
+gcloud iam service-accounts add-iam-policy-binding \
+    kubeip-service-account@$PROJECT_ID.iam.gserviceaccount.com \
+    --role=roles/iam.workloadIdentityUser \
+    --member="serviceAccount:${PROJECT_ID}.svc.id.goog[kube-system/kubeip-sa]"
 ```
 
 **Create Static, Reserved IP Addresses:**
@@ -95,19 +88,29 @@ Add labels to reserved IP addresses. A common practice is to assign a unique val
 for i in {1..10}; do gcloud beta compute addresses update kubeip-ip$i --update-labels kubeip=$GKE_CLUSTER_NAME --region $GCP_REGION; done
 ```
 
+Install kubeIP with Helm. `KUBEIP_LABELVALUE` should be your GKE cluster name, and `KUBEIP_NODEPOOL` should be the node pool kubeIP assigns addresses to. `KUBEIP_FORCEASSIGNMENT` defaults to true and assigns reserved addresses to existing nodes in that pool. Run the kubeIP pod on a different pool (`KUBEIP_SELF_NODEPOOL`).
+
 ```
-sed -i -e "s/reserved/$GKE_CLUSTER_NAME/g" -e "s/default-pool/$KUBEIP_NODEPOOL/g" deploy/kubeip-configmap.yaml
+helm upgrade --install kubeip helm/kubeip \
+    --namespace kube-system \
+    --set gsa_name=kubeip-service-account@$PROJECT_ID.iam.gserviceaccount.com \
+    --set env.KUBEIP_LABELVALUE=$GKE_CLUSTER_NAME \
+    --set env.KUBEIP_NODEPOOL=$KUBEIP_NODEPOOL \
+    --set-json "nodeSelector={\"cloud.google.com/gke-nodepool\":\"$KUBEIP_SELF_NODEPOOL\"}"
 ```
 
-Make sure the `deploy/kubeip-configmap.yaml` file contains the correct values:
+To assign addresses to other node pools, set `env.KUBEIP_ADDITIONALNODEPOOLS` to a comma-separated list. Tag those addresses with the `KUBEIP_LABELKEY` value + `-node-pool` and the node pool name, for example `kubeip-node-pool=my-node-pool`.
 
- - The `KUBEIP_LABELVALUE` should be your GKE's cluster name
- - The `KUBEIP_NODEPOOL` should match the name of your GKE node-pool on which kubeIP will operate
- - The `KUBEIP_FORCEASSIGNMENT` - controls whether kubeIP should assign static IPs to existing nodes in the node-pool and defaults to true
+```
+helm upgrade --install kubeip helm/kubeip \
+    --namespace kube-system \
+    --reuse-values \
+    --set env.KUBEIP_ADDITIONALNODEPOOLS=my-node-pool
+```
 
-We recommend that KUBEIP_NODEPOOL should *NOT* be the same as KUBEIP_SELF_NODEPOOL
+**Move an existing deploy/ installation**
 
-
+Helm 4 can adopt the Deployment, ServiceAccount, ClusterRole, and ClusterRoleBinding that `kubectl apply -f deploy/` created. Copy the live settings first, because the chart does not read the `kubeip-config` ConfigMap:
 To assign addresses to other node pools, set `KUBEIP_ADDITIONALNODEPOOLS` to a comma-separated list. A pool name is an exact match and uses that name as the address tag: `my-node-pool,other-pool` looks for `kubeip-node-pool=my-node-pool` and `kubeip-node-pool=other-pool`.
 
 To use a different tag, write `node_pool|ip_tag`. Tag those addresses with the `KUBEIP_LABELKEY` value + `-node-pool` and the `ip_tag`, for example `kubeip-node-pool=batch-ips` for an entry `batch-pool|batch-ips`.
@@ -117,13 +120,15 @@ In the `node_pool|ip_tag` form, a selector that ends with `*` matches every node
 `KUBEIP_NODEPOOL` still uses reserved addresses that have no `{KUBEIP_LABELKEY}-node-pool` label.
 
 ```
-sed -i -e "s/pool-kubip/$KUBEIP_SELF_NODEPOOL/g" deploy/kubeip-deployment.yaml
+kubectl -n kube-system get configmap kubeip-config -o jsonpath='{.data}{"\n"}'
+kubectl -n kube-system get deploy kubeip -o jsonpath='{.spec.template.spec.nodeSelector}{"\n"}'
+kubectl -n kube-system get sa kubeip-sa -o jsonpath='{.metadata.annotations.iam\.gke\.io/gcp-service-account}{"\n"}'
 ```
 
-Deploy kubeIP by running:
+Pass those values to the same `helm upgrade --install` command and add `--take-ownership`. The Workload Identity binding above must already exist: the upgraded pod no longer mounts `kubeip-key`. After the new pod is assigning addresses, remove the objects the chart does not manage:
 
 ```
-kubectl apply -f deploy/.
+kubectl -n kube-system delete configmap kubeip-config secret kubeip-key
 ```
 
 Once you’ve assigned an IP address to a node kubeIP, a label will be created for that node `kubip_assigned` with the value of the IP address (`.` are replaced with `-`):
@@ -152,11 +157,14 @@ To order the IPs reserved above in asc order use
 for i in {1..10}; do gcloud beta compute addresses update kubeip-ip$i --update-labels priority=$i --region=$GCP_REGION; done
 ```
 
-and set 
+and upgrade the release:
 
 ```
-KUBEIP_ORDERBYLABELKEY: "priority"
-KUBEIP_ORDERBYDESC: "false"
+helm upgrade kubeip helm/kubeip \
+    --namespace kube-system \
+    --reuse-values \
+    --set env.KUBEIP_ORDERBYLABELKEY=priority \
+    --set env.KUBEIP_ORDERBYDESC=false
 ```
 
 **Copy Labels**
@@ -264,7 +272,7 @@ docker push gcr.io/$PROJECT_ID/kubeip
 
 Alternatively, you can export `REGISTRY` to `gcr.io/$PROJECT_ID` and run the script `build-all-and-push.sh` which builds and publishes the docker image.
 
-**Create IAM Service Account and obtain the Key in JSON format**
+**Create an IAM service account**
 
 Create a Service Account with this command:
 
@@ -280,16 +288,16 @@ gcloud iam roles create kubeip --project $PROJECT_ID --file roles.yaml
 gcloud projects add-iam-policy-binding $PROJECT_ID --member serviceAccount:kubeip-service-account@$PROJECT_ID.iam.gserviceaccount.com --role projects/$PROJECT_ID/roles/kubeip
 ```
 
-Use workload identity or generate the Key using the following command:
+Allow the Kubernetes service account to use it through Workload Identity:
 
 ```
-gcloud iam service-accounts keys create key.json \
-  --iam-account kubeip-service-account@$PROJECT_ID.iam.gserviceaccount.com
+gcloud iam service-accounts add-iam-policy-binding \
+    kubeip-service-account@$PROJECT_ID.iam.gserviceaccount.com \
+    --role=roles/iam.workloadIdentityUser \
+    --member="serviceAccount:${PROJECT_ID}.svc.id.goog[kube-system/kubeip-sa]"
 ```
 
-**Create Kubernetes Secret - skip if using workload identity **
-
-Get your GKE cluster credentaials with (replace *cluster_name* with your real GKE cluster name):
+**Get cluster credentials and RBAC permissions**
 
 ```
 gcloud container clusters get-credentials $GKE_CLUSTER_NAME \
@@ -297,13 +305,6 @@ gcloud container clusters get-credentials $GKE_CLUSTER_NAME \
     --project $PROJECT_ID
 ```
 
-Create a Kubernetes secret by running (skip if using workload identity):
-
-```
-kubectl create secret generic kubeip-key --from-file=key.json -n kube-system
-```
-
-**We need to get RBAC permissions first with**
 ```
 kubectl create clusterrolebinding cluster-admin-binding \
     --clusterrole cluster-admin --user `gcloud config list --format 'value(core.account)'`
@@ -323,24 +324,16 @@ Add labels to reserved IP addresses. A common practice is to assign a unique val
 for i in {1..10}; do gcloud beta compute addresses update kubeip-ip$i --update-labels kubeip=$GKE_CLUSTER_NAME --region $GCP_REGION; done
 ```
 
-Adjust the deploy/kubeip-configmap.yaml with your GKE cluster name (replace the GKE-cluster-name with your real GKE cluster name):
+By default, kubeIP manages nodes in the `default-pool` node pool and looks for addresses labeled `kubeip=reserved`. Set `env.KUBEIP_NODEPOOL`, `env.KUBEIP_LABELKEY`, and `env.KUBEIP_LABELVALUE` to change that. `KUBEIP_FORCEASSIGNMENT` defaults to true and, on startup and every five minutes, assigns a reserved address to nodes in the pool that do not have one.
+
+Install the image you pushed:
 
 ```
-sed -i -e "s/reserved/$GKE_CLUSTER_NAME/g" deploy/kubeip-configmap.yaml
-```
-
-Adjust the `deploy/kubeip-deployment.yaml` to reflect your real container image path:
-
- - Edit the `image` to match your container image path, i.e. `gcr.io/$PROJECT_ID/kubeip`
-
-By default, kubeIP will only manage the nodes in default-pool nodepool. If you'd like kubeIP to manage another node-pool, please update the `KUBEIP_NODEPOOL` setting in `deploy/kubeip-configmap.yaml` file before deploying. You can also update the `KUBEIP_LABELKEY` and `KUBEIP_LABELVALUE` to control which static external IP addresses the kubeIP will look for to assign to your nodes. 
-
-The `KUBEIP_FORCEASSIGNMENT` (which defaults to true) will check on startup and every five minutes if there are nodes in the node-pool that are not assigned to a reserved address. If such nodes are found, then kubeIP will assign a reserved address (if one is available to them):
-
-Deploy kubeIP by running
-
-```
-kubectl apply -f deploy/.
+helm upgrade --install kubeip helm/kubeip \
+    --namespace kube-system \
+    --set image=gcr.io/$PROJECT_ID/kubeip \
+    --set gsa_name=kubeip-service-account@$PROJECT_ID.iam.gserviceaccount.com \
+    --set env.KUBEIP_LABELVALUE=$GKE_CLUSTER_NAME
 ```
 
 References:
