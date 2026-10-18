@@ -53,16 +53,13 @@ clean-image: stop
 $(BIN):
 	@mkdir -p $@
 $(BIN)/%: | $(BIN) ; $(info $(M) building $(PACKAGE)...)
-	$Q tmp=$$(mktemp -d); \
-	   env GO111MODULE=off GOPATH=$$tmp GOBIN=$(BIN) $(GO) get $(PACKAGE) \
-		|| ret=$$?; \
-	   rm -rf $$tmp ; exit $$ret
+	$Q env GOBIN=$(BIN) $(GO) install $(PACKAGE)@latest
 
 GOLINT = $(BIN)/golint
 $(BIN)/golint: PACKAGE=golang.org/x/lint/golint
 
 GOCOV = $(BIN)/gocov
-$(BIN)/gocov: PACKAGE=github.com/axw/gocov/...
+$(BIN)/gocov: PACKAGE=github.com/axw/gocov/gocov
 
 GOCOVXML = $(BIN)/gocov-xml
 $(BIN)/gocov-xml: PACKAGE=github.com/AlekSi/gocov-xml

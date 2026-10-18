@@ -21,10 +21,12 @@
 package controller
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -36,7 +38,6 @@ import (
 	"github.com/doitintl/kubeip/pkg/types"
 	"github.com/doitintl/kubeip/pkg/utils"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/net/context"
 	api_v1 "k8s.io/api/core/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -57,16 +58,17 @@ type AddressInstanceTuple struct {
 
 // Controller object
 type Controller struct {
-	logger      *logrus.Entry
-	clientset   kubernetes.Interface
-	queue       workqueue.RateLimitingInterface
-	informer    cache.SharedIndexInformer
-	instance    chan<- types.Instance
-	projectID   string
-	clusterName string
-	config      *cfg.Config
-	ticker      *time.Ticker
-	processing  bool
+	logger          *logrus.Entry
+	clientset       kubernetes.Interface
+	queue           workqueue.RateLimitingInterface
+	informer        cache.SharedIndexInformer
+	instance        chan<- types.Instance
+	projectID       string
+	clusterName     string
+	clusterLocation string
+	config          *cfg.Config
+	ticker          *time.Ticker
+	assignmentMu    sync.Mutex
 }
 
 // Event indicate the informerEvent
@@ -80,7 +82,8 @@ var serverStartTime time.Time
 
 const maxRetries = 5
 
-const prefix = "kube-system/kube-proxy-"
+const kubeSystemNamespace = "kube-system"
+const prefix = kubeSystemNamespace + "/kube-proxy-"
 
 // Start kubeip controller
 func Start(config *cfg.Config) error {
@@ -96,10 +99,10 @@ func Start(config *cfg.Config) error {
 	informer := cache.NewSharedIndexInformer(
 		&cache.ListWatch{
 			ListFunc: func(options meta_v1.ListOptions) (runtime.Object, error) {
-				return kubeClient.CoreV1().Pods(meta_v1.NamespaceAll).List(context.Background(), options)
+				return kubeClient.CoreV1().Pods(kubeSystemNamespace).List(context.Background(), options)
 			},
 			WatchFunc: func(options meta_v1.ListOptions) (watch.Interface, error) {
-				return kubeClient.CoreV1().Pods(meta_v1.NamespaceAll).Watch(context.Background(), options)
+				return kubeClient.CoreV1().Pods(kubeSystemNamespace).Watch(context.Background(), options)
 			},
 		},
 		&api_v1.Pod{},
@@ -115,6 +118,10 @@ func Start(config *cfg.Config) error {
 	c.clusterName, err = kipcompute.ClusterName()
 	if err != nil {
 		return errors.Wrap(err, "Can not get cluster name")
+	}
+	c.clusterLocation, err = kipcompute.ClusterLocation()
+	if err != nil {
+		return errors.Wrap(err, "Can not get cluster location")
 	}
 	c.config = config
 	c.ticker = time.NewTicker(c.config.Ticker * time.Minute)
@@ -162,11 +169,10 @@ func newResourceController(client kubernetes.Interface, informer cache.SharedInd
 	})
 
 	return &Controller{
-		logger:     logrus.WithField("pkg", "kubeip-"+resourceType),
-		clientset:  client,
-		informer:   informer,
-		queue:      queue,
-		processing: false,
+		logger:    logrus.WithField("pkg", "kubeip-"+resourceType),
+		clientset: client,
+		informer:  informer,
+		queue:     queue,
 	}
 }
 
@@ -237,12 +243,8 @@ func (c *Controller) isNodePoolMonitored(pool string) bool {
 	if strings.EqualFold(pool, c.config.NodePool) {
 		return true
 	}
-	for _, ns := range c.config.AdditionalNodePools {
-		if strings.EqualFold(pool, ns) {
-			return true
-		}
-	}
-	return false
+	_, _, ok := c.config.MatchAdditionalPool(pool)
+	return ok
 }
 func (c *Controller) processItem(newEvent Event) error {
 	obj, _, err := c.informer.GetIndexer().GetByKey(newEvent.key)
@@ -328,7 +330,23 @@ func (c *Controller) processAllNodes(shouldCheckOptimalIPAssignment bool) error 
 		return errors.Wrap(err, "Can not get kubernetes API")
 	}
 	logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "processAllNodes"}).Info("Collecting Node List...")
-	nodelist, _ := kubeClient.CoreV1().Nodes().List(context.Background(), meta_v1.ListOptions{})
+	selector := "cloud.google.com/gke-nodepool"
+	if !c.config.AllNodePools {
+		pools, err := c.monitoredPoolNames()
+		if err != nil {
+			logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "processAllNodes"}).Errorf("Can not read cluster node pools: %v", err)
+		}
+		if len(pools) == 0 {
+			return nil
+		}
+		selector = nodePoolInSelector(pools)
+	}
+	nodelist, err := kubeClient.CoreV1().Nodes().List(context.Background(), meta_v1.ListOptions{
+		LabelSelector: selector,
+	})
+	if err != nil {
+		return errors.Wrap(err, "Can not list nodes")
+	}
 	var pool string
 	var ok bool
 	var nodesOfInterest []types.Instance
@@ -433,27 +451,49 @@ func (c *Controller) processAllNodes(shouldCheckOptimalIPAssignment bool) error 
 		}
 	}
 
+	resourcesByRegion := map[string][]string{}
+	failedRegions := map[string]struct{}{}
 	for _, inst := range nodesOfInterest {
-		if !kipcompute.IsInstanceUsesReservedIP(c.projectID, inst.Name, inst.Zone, c.config) {
-			logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "processAllNodes"}).Infof("Found unassigned node %s in pool %s", inst.Name, inst.Pool)
-			c.instance <- inst
+		region := inst.Zone[:len(inst.Zone)-2]
+		if _, seen := resourcesByRegion[region]; seen {
+			continue
 		}
+		if _, failed := failedRegions[region]; failed {
+			continue
+		}
+		resources, err := kipcompute.ListInUseReservedAddressResources(c.projectID, region, c.config)
+		if err != nil {
+			logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "processAllNodes"}).Errorf("Can not list in-use reserved IPs in region %s: %v", region, err)
+			failedRegions[region] = struct{}{}
+			continue
+		}
+		resourcesByRegion[region] = resources
+	}
+	for _, inst := range nodesOfInterest {
+		region := inst.Zone[:len(inst.Zone)-2]
+		if _, failed := failedRegions[region]; failed {
+			continue
+		}
+		if kipcompute.InstanceOnReservedAddress(resourcesByRegion[region], inst.Name) {
+			continue
+		}
+		logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "processAllNodes"}).Infof("Found unassigned node %s in pool %s", inst.Name, inst.Pool)
+		c.instance <- inst
 	}
 	return nil
 }
 
 func (c *Controller) forceAssignmentOnce(shouldCheckOptimalIPAssignment bool) {
-	if !c.processing {
-		c.processing = true
-		if c.config.ForceAssignment {
-			logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "forceAssignmentOnce"}).Info("Starting forceAssignmentOnce")
-			c.processAllNodes(shouldCheckOptimalIPAssignment)
-		}
-		c.assignMissingTags()
-		c.processing = false
-	} else {
+	if !c.assignmentMu.TryLock() {
 		logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "forceAssignmentOnce"}).Info("Skipping forceAssignmentOnce ... already in progress")
+		return
 	}
+	defer c.assignmentMu.Unlock()
+	if c.config.ForceAssignment {
+		logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "forceAssignmentOnce"}).Info("Starting forceAssignmentOnce")
+		c.processAllNodes(shouldCheckOptimalIPAssignment)
+	}
+	c.assignMissingTags()
 }
 
 func (c *Controller) forceAssignment() {
@@ -466,37 +506,82 @@ func (c *Controller) forceAssignment() {
 }
 
 func (c *Controller) assignMissingTags() error {
-	nodePools := append(c.config.AdditionalNodePools, c.config.NodePool)
-
 	kubeClient, err := utils.GetClient()
 	if err != nil {
 		return errors.Wrap(err, "Can not get kubernetes API")
 	}
 
-	for _, pool := range nodePools {
-		label := fmt.Sprintf("!kubip_assigned,cloud.google.com/gke-nodepool=%s", pool)
-		nodelist, err := kubeClient.CoreV1().Nodes().List(context.Background(), meta_v1.ListOptions{
-			LabelSelector: label,
-		})
-		if err != nil {
-			logrus.Error(err)
+	pools, err := c.monitoredPoolNames()
+	if err != nil {
+		logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "assignMissingTags"}).Errorf("Can not read cluster node pools: %v", err)
+	}
+	if len(pools) == 0 {
+		return nil
+	}
+	nodelist, err := kubeClient.CoreV1().Nodes().List(context.Background(), meta_v1.ListOptions{
+		LabelSelector: "!kubip_assigned," + nodePoolInSelector(pools),
+	})
+	if err != nil {
+		logrus.Error(err)
+		return nil
+	}
+	c.tagNodesMissingAssignment(nodelist.Items)
+	return nil
+}
+
+// monitoredPoolNames is the exact pool names kubeip should list.
+// A prefix rule is expanded with the cluster's node pool names so the node list
+// can use an exact label selector instead of every node in the cluster.
+func (c *Controller) monitoredPoolNames() ([]string, error) {
+	var pools []string
+	if c.config.NodePool != "" {
+		pools = appendUnique(pools, c.config.NodePool)
+	}
+	wildcard := false
+	for _, binding := range c.config.AdditionalNodePools {
+		if binding.Wildcard {
+			wildcard = true
 			continue
-
 		}
-		for _, node := range nodelist.Items {
-			labels := node.GetLabels()
-			if nodeZone, ok := labels["failure-domain.beta.kubernetes.io/zone"]; ok {
-				if err != nil {
-					logrus.WithError(err).Error("Could not get node zone")
-					continue
-				}
-				logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "assignMissingTags"}).Infof("Found node without tag %s", node.GetName())
-				kipcompute.AddTagIfMissing(c.projectID, node.GetName(), nodeZone, c.config)
-
-			} else {
-				continue
-			}
+		pools = appendUnique(pools, binding.Selector)
+	}
+	if !wildcard {
+		return pools, nil
+	}
+	names, err := kipcompute.ListClusterNodePoolNames(c.projectID, c.clusterLocation, c.clusterName)
+	if err != nil {
+		return pools, err
+	}
+	for _, name := range names {
+		_, matchedWildcard, ok := c.config.MatchAdditionalPool(name)
+		if ok && matchedWildcard {
+			pools = appendUnique(pools, name)
 		}
 	}
-	return nil
+	return pools, nil
+}
+
+func nodePoolInSelector(pools []string) string {
+	return "cloud.google.com/gke-nodepool in (" + strings.Join(pools, ",") + ")"
+}
+
+func appendUnique(pools []string, name string) []string {
+	for _, existing := range pools {
+		if existing == name {
+			return pools
+		}
+	}
+	return append(pools, name)
+}
+
+func (c *Controller) tagNodesMissingAssignment(nodes []api_v1.Node) {
+	for _, node := range nodes {
+		labels := node.GetLabels()
+		nodeZone, ok := labels["failure-domain.beta.kubernetes.io/zone"]
+		if !ok {
+			continue
+		}
+		logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "assignMissingTags"}).Infof("Found node without tag %s", node.GetName())
+		kipcompute.AddTagIfMissing(c.projectID, node.GetName(), nodeZone, c.config)
+	}
 }

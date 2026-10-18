@@ -108,8 +108,13 @@ Make sure the `deploy/kubeip-configmap.yaml` file contains the correct values:
 We recommend that KUBEIP_NODEPOOL should *NOT* be the same as KUBEIP_SELF_NODEPOOL
 
 
-If you would like to assign addresses to other node pools, then `KUBEIP_NODEPOOL` can be added to this nodepool `KUBEIP_ADDITIONALNODEPOOLS` as a comma separated list.
-You should tag the addresses for this pool with the `KUBEIP_LABELKEY` value + `-node-pool` and assign the value of the node pool a name i.e.,  `kubeip-node-pool=my-node-pool`
+To assign addresses to other node pools, set `KUBEIP_ADDITIONALNODEPOOLS` to a comma-separated list. A pool name is an exact match and uses that name as the address tag: `my-node-pool,other-pool` looks for `kubeip-node-pool=my-node-pool` and `kubeip-node-pool=other-pool`.
+
+To use a different tag, write `node_pool|ip_tag`. Tag those addresses with the `KUBEIP_LABELKEY` value + `-node-pool` and the `ip_tag`, for example `kubeip-node-pool=batch-ips` for an entry `batch-pool|batch-ips`.
+
+In the `node_pool|ip_tag` form, a selector that ends with `*` matches every node pool with that prefix, and those pools share one tag. `workers-*|worker-ips` assigns addresses labeled `kubeip-node-pool=worker-ips` to pools such as `workers-a` and `workers-b`. An exact pool name is not a prefix, including a name that ends with `*`.
+
+`KUBEIP_NODEPOOL` still uses reserved addresses that have no `{KUBEIP_LABELKEY}-node-pool` label.
 
 ```
 sed -i -e "s/pool-kubip/$KUBEIP_SELF_NODEPOOL/g" deploy/kubeip-deployment.yaml

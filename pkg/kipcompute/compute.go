@@ -21,11 +21,14 @@
 package kipcompute
 
 import (
+	"context"
 	"fmt"
 	"math"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/compute/metadata"
@@ -34,10 +37,9 @@ import (
 	"github.com/doitintl/kubeip/pkg/utils"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/net/context"
-	"golang.org/x/oauth2/google"
 	"google.golang.org/api/compute/v0.beta"
 	"google.golang.org/api/container/v1"
+	"google.golang.org/api/googleapi"
 )
 
 // ClusterName get GKE cluster name from metadata
@@ -45,9 +47,75 @@ func ClusterName() (string, error) {
 	return metadata.InstanceAttributeValue("cluster-name")
 }
 
+// ClusterLocation get GKE cluster location from metadata
+func ClusterLocation() (string, error) {
+	return metadata.InstanceAttributeValue("cluster-location")
+}
+
 // ProjectName get GCP project name from metadata
 func ProjectName() (string, error) {
 	return metadata.ProjectID()
+}
+
+var (
+	containerMu      sync.Mutex
+	containerService *container.Service
+	computeMu        sync.Mutex
+	computeService   *compute.Service
+)
+
+func getContainerService() (*container.Service, error) {
+	containerMu.Lock()
+	defer containerMu.Unlock()
+	if containerService != nil {
+		return containerService, nil
+	}
+	svc, err := container.NewService(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	containerService = svc
+	return containerService, nil
+}
+
+func getComputeService() (*compute.Service, error) {
+	computeMu.Lock()
+	defer computeMu.Unlock()
+	if computeService != nil {
+		return computeService, nil
+	}
+	svc, err := compute.NewService(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	computeService = svc
+	return computeService, nil
+}
+
+// ListClusterNodePoolNames returns the node pool names on this cluster.
+// The names come from clusters.get, which is enough to turn a prefix rule into exact pools
+// without listing every Kubernetes node.
+func ListClusterNodePoolNames(projectID, location, cluster string) ([]string, error) {
+	containerService, err := getContainerService()
+	if err != nil {
+		return nil, readNodePoolsError(projectID, location, cluster, err)
+	}
+	name := fmt.Sprintf("projects/%s/locations/%s/clusters/%s", projectID, location, cluster)
+	got, err := containerService.Projects.Locations.Clusters.Get(name).Do()
+	if err != nil {
+		return nil, readNodePoolsError(projectID, location, cluster, err)
+	}
+	names := make([]string, 0, len(got.NodePools))
+	for _, pool := range got.NodePools {
+		if pool != nil && pool.Name != "" {
+			names = append(names, pool.Name)
+		}
+	}
+	return names, nil
+}
+
+func readNodePoolsError(projectID, location, cluster string, err error) error {
+	return errors.Wrapf(err, "can not read node pools for cluster %s in %s project %s", cluster, location, projectID)
 }
 
 func getPriorityOrder(address *compute.Address, config *cfg.Config) int {
@@ -62,7 +130,7 @@ func getPriorityOrder(address *compute.Address, config *cfg.Config) int {
 	if ok {
 		intVal, err := strconv.Atoi(strVal)
 		if err != nil {
-			logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "getPriorityOrder"}).Errorf("Address %s has errors. Failed to convert order by label value %s with value %s to integer", address.Name, config.OrderByLabelKey, strVal, err)
+			logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "getPriorityOrder"}).Errorf("Address %s has errors. Failed to convert order by label value %s with value %s to integer: %v", address.Name, config.OrderByLabelKey, strVal, err)
 			return defaultValue
 		}
 		return intVal
@@ -77,22 +145,41 @@ func GetAllAddresses(projectID string, region string, filterJustReserved bool, c
 	return getAllAddresses(projectID, region, config.NodePool, filterJustReserved, config)
 }
 
-func getAllAddresses(projectID string, region string, pool string, filterJustReserved bool, config *cfg.Config) (*compute.AddressList, error) {
-	hc, err := google.DefaultClient(context.Background(), container.CloudPlatformScope)
-	if err != nil {
-		logrus.Error(err)
-		return nil, err
-	}
-	computeService, err := compute.New(hc)
-	if err != nil {
-		logrus.Error(err)
-		return nil, err
-	}
-	var filter string
+func addressFilter(pool string, config *cfg.Config) (string, error) {
+	base := "(labels." + config.LabelKey + "=" + config.LabelValue + ")"
 	if config.AllNodePools || strings.EqualFold(pool, config.NodePool) {
-		filter = "(labels." + config.LabelKey + "=" + config.LabelValue + ")" + " AND  (-labels." + config.LabelKey + "-node-pool:*)"
-	} else {
-		filter = "(labels." + config.LabelKey + "=" + config.LabelValue + ")" + " AND " + "(labels." + config.LabelKey + "-node-pool=" + pool + ")"
+		return base + " AND  (-labels." + config.LabelKey + "-node-pool:*)", nil
+	}
+	tag, _, ok := config.MatchAdditionalPool(pool)
+	if !ok {
+		return "", fmt.Errorf("no additional node pool binding for pool %s", pool)
+	}
+	return base + " AND " + "(labels." + config.LabelKey + "-node-pool=" + tag + ")", nil
+}
+
+// listAllAddresses returns every address matching filter. Compute returns at most 500 per page.
+func listAllAddresses(svc *compute.Service, projectID, region, filter string) ([]*compute.Address, error) {
+	var items []*compute.Address
+	err := svc.Addresses.List(projectID, region).Filter(filter).Pages(context.Background(), func(page *compute.AddressList) error {
+		items = append(items, page.Items...)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+func getAllAddresses(projectID string, region string, pool string, filterJustReserved bool, config *cfg.Config) (*compute.AddressList, error) {
+	computeService, err := getComputeService()
+	if err != nil {
+		logrus.Error(err)
+		return nil, err
+	}
+	filter, err := addressFilter(pool, config)
+	if err != nil {
+		logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "getAllAddresses"}).Error(err)
+		return nil, err
 	}
 
 	var computedFilter string
@@ -102,13 +189,12 @@ func getAllAddresses(projectID string, region string, pool string, filterJustRes
 		computedFilter = filter
 	}
 
-	var addresses *compute.AddressList
-	addresses, err = computeService.Addresses.List(projectID, region).Filter(computedFilter).Do()
-
+	items, err := listAllAddresses(computeService, projectID, region, computedFilter)
 	if err != nil {
 		logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "getAllAddresses"}).Errorf("Failed to list IP addresses: %q", err)
 		return nil, err
 	}
+	addresses := &compute.AddressList{Items: items}
 
 	// Right now the SDK does not support filter and order together, so we do it programmatically.
 	sort.SliceStable(addresses.Items, func(i, j int) bool {
@@ -142,15 +228,9 @@ func findFreeAddress(projectID string, region string, pool string, config *cfg.C
 
 // DeleteIP delete current IP on GKE node
 func DeleteIP(projectID string, zone string, instance string, config *cfg.Config) error {
-	hc, err := google.DefaultClient(context.Background(), container.CloudPlatformScope)
+	computeService, err := getComputeService()
 	if err != nil {
 		logrus.Fatalf("Could not get authenticated client: %v", err)
-	}
-
-	computeService, err := compute.New(hc)
-	if err != nil {
-		logrus.Infof(err.Error())
-		return err
 	}
 	inst, err := computeService.Instances.Get(projectID, zone, instance).Do()
 	if err != nil {
@@ -181,15 +261,9 @@ func DeleteIP(projectID string, zone string, instance string, config *cfg.Config
 }
 
 func addIP(projectID string, zone string, instance string, pool string, addr types.IPAddress, config *cfg.Config) error {
-	hc, err := google.DefaultClient(context.Background(), container.CloudPlatformScope)
+	computeService, err := getComputeService()
 	if err != nil {
 		logrus.Fatalf("Could not get authenticated client: %v", err)
-	}
-
-	computeService, err := compute.New(hc)
-	if err != nil {
-		logrus.Infof(err.Error())
-		return err
 	}
 
 	if config.DryRun {
@@ -253,40 +327,82 @@ func replaceIP(projectID string, zone string, instance string, pool string, conf
 
 }
 
-func waitForCompilation(projectID string, zone string, operation *compute.Operation) (err error) {
-	hc, err := google.DefaultClient(context.Background(), container.CloudPlatformScope)
-	if err != nil {
-		logrus.Fatalf("Could not get authenticated client: %v", err)
-		return err
-	}
-	computeService, err := compute.New(hc)
+const (
+	operationPollInterval = 2 * time.Second
+	operationHTTPRetries  = 5
+)
+
+func waitForCompilation(projectID string, zone string, operation *compute.Operation) error {
+	computeService, err := getComputeService()
 	if err != nil {
 		logrus.Fatalf("Could not get create compute service: %v", err)
 		return err
 	}
+	httpRetries := 0
 	for {
 		op, err := computeService.ZoneOperations.Get(projectID, zone, operation.Name).Do()
 		if err != nil {
-			logrus.Errorf("ZoneOperations.Get %q %s", err, operation.Name)
-			return err
+			if httpRetries >= operationHTTPRetries || !retryableOperationHTTPError(err) {
+				logrus.Errorf("ZoneOperations.Get %q %s", err, operation.Name)
+				return err
+			}
+			httpRetries++
+			delay := operationPollInterval << (httpRetries - 1)
+			logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "waitForCompilation"}).Warnf("ZoneOperations.Get %s: %v; retry %d/%d in %s", operation.Name, err, httpRetries, operationHTTPRetries, delay)
+			time.Sleep(delay)
+			continue
 		}
+		httpRetries = 0
 		if strings.ToLower(op.Status) != "done" {
-			time.Sleep(2 * time.Second)
-		} else {
-			return nil
+			time.Sleep(operationPollInterval)
+			continue
+		}
+		if opErr := operationError(op); opErr != nil {
+			logrus.Errorf("Operation %s failed: %v", operation.Name, opErr)
+			return opErr
+		}
+		return nil
+	}
+}
+
+func retryableOperationHTTPError(err error) bool {
+	apiErr, ok := errors.Cause(err).(*googleapi.Error)
+	if !ok {
+		return true
+	}
+	switch apiErr.Code {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func operationError(op *compute.Operation) error {
+	if op.Error != nil {
+		parts := make([]string, 0, len(op.Error.Errors))
+		for _, item := range op.Error.Errors {
+			if item == nil {
+				continue
+			}
+			msg := strings.TrimSpace(item.Code + " " + item.Message)
+			if msg != "" {
+				parts = append(parts, msg)
+			}
+		}
+		if len(parts) > 0 {
+			return fmt.Errorf("operation %s failed: %s", op.Name, strings.Join(parts, "; "))
 		}
 	}
+	if op.HttpErrorStatusCode != 0 {
+		return fmt.Errorf("operation %s failed: %d %s", op.Name, op.HttpErrorStatusCode, op.HttpErrorMessage)
+	}
+	return nil
 }
 
 // GetAddressUsedByInstance returns the IP used by this instance or the broadcast address otherwise.
 func GetAddressUsedByInstance(projectID string, instance string, zone string, config *cfg.Config) (string, error) {
-	hc, err := google.DefaultClient(context.Background(), container.CloudPlatformScope)
-	if err != nil {
-		logrus.Fatalf("Could not get authenticated client: %v", err)
-		return "", err
-	}
-
-	computeService, err := compute.New(hc)
+	computeService, err := getComputeService()
 	if err != nil {
 		logrus.Fatalf("Could not get create compute service: %v", err)
 		return "", err
@@ -294,13 +410,13 @@ func GetAddressUsedByInstance(projectID string, instance string, zone string, co
 
 	region := zone[:len(zone)-2]
 	filter := "(labels." + config.LabelKey + "=" + config.LabelValue + ")"
-	addresses, err := computeService.Addresses.List(projectID, region).Filter(filter).Do()
+	addresses, err := listAllAddresses(computeService, projectID, region, filter)
 	if err != nil {
 		logrus.Fatalf("Could not list addresses for instance %s: %v", instance, err)
 		return "", err
 	}
 
-	for _, addr := range addresses.Items {
+	for _, addr := range addresses {
 		if len(addr.Users) > 0 && strings.Contains(addr.Users[0], instance) {
 			return addr.Address, nil
 		}
@@ -309,33 +425,46 @@ func GetAddressUsedByInstance(projectID string, instance string, zone string, co
 	return "0.0.0.0", nil
 }
 
-// IsInstanceUsesReservedIP test if GKE node is using reserved IP
-func IsInstanceUsesReservedIP(projectID string, instance string, zone string, config *cfg.Config) bool {
-	ctx := context.Background()
-	hc, err := google.DefaultClient(ctx, container.CloudPlatformScope)
+// ListInUseReservedAddressResources returns the resource URLs attached to in-use kubeip addresses in one region.
+func ListInUseReservedAddressResources(projectID string, region string, config *cfg.Config) ([]string, error) {
+	svc, err := getComputeService()
 	if err != nil {
-		logrus.Error(err)
-		return false
+		return nil, err
 	}
-	computeService, err := compute.New(hc)
+	filter := "(status=IN_USE) AND (labels." + config.LabelKey + "=" + config.LabelValue + ")"
+	addresses, err := listAllAddresses(svc, projectID, region, filter)
 	if err != nil {
-		logrus.Error(err)
-		return false
+		return nil, err
 	}
-	region := zone[:len(zone)-2]
-	filter := "(labels." + config.LabelKey + "=" + config.LabelValue + ")"
-	addresses, err := computeService.Addresses.List(projectID, region).Filter("(status=IN_USE) AND " + filter).Do()
-	if err != nil {
-		logrus.Error(err)
-		return false
+	resources := make([]string, 0, len(addresses))
+	for _, addr := range addresses {
+		if len(addr.Users) == 0 {
+			continue
+		}
+		resources = append(resources, addr.Users[0])
 	}
+	return resources, nil
+}
 
-	for _, addr := range addresses.Items {
-		if strings.Contains(addr.Users[0], instance) {
+// InstanceOnReservedAddress reports whether instance appears in one of the reserved-address resource URLs.
+func InstanceOnReservedAddress(resources []string, instance string) bool {
+	for _, resource := range resources {
+		if strings.Contains(resource, instance) {
 			return true
 		}
 	}
 	return false
+}
+
+// IsInstanceUsesReservedIP reports whether the GKE node is using a reserved IP.
+// A list failure is returned as an error so the caller does not treat it as "no reserved IP".
+func IsInstanceUsesReservedIP(projectID string, instance string, zone string, config *cfg.Config) (bool, error) {
+	region := zone[:len(zone)-2]
+	resources, err := ListInUseReservedAddressResources(projectID, region, config)
+	if err != nil {
+		return false, err
+	}
+	return InstanceOnReservedAddress(resources, instance), nil
 }
 
 // Kubeip replace GKE node IP
@@ -343,60 +472,65 @@ func Kubeip(instance <-chan types.Instance, config *cfg.Config) {
 	for {
 		inst := <-instance
 		logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "Kubeip"}).Infof("Working on %s in zone %s", inst.Name, inst.Zone)
-		if !IsInstanceUsesReservedIP(inst.ProjectID, inst.Name, inst.Zone, config) {
-			_ = replaceIP(inst.ProjectID, inst.Zone, inst.Name, inst.Pool, config)
+		usesReserved, err := IsInstanceUsesReservedIP(inst.ProjectID, inst.Name, inst.Zone, config)
+		if err != nil {
+			logrus.WithError(err).Errorf("can not check reserved IP for %s", inst.Name)
+			continue
+		}
+		if !usesReserved {
+			err := replaceIP(inst.ProjectID, inst.Zone, inst.Name, inst.Pool, config)
+			if err != nil {
+				logrus.WithError(err).Errorf("can not replace IP for %s", inst.Name)
+				if cordonErr := utils.CordonNode(inst.Name, config); cordonErr != nil {
+					logrus.WithError(cordonErr).Errorf("can not cordon node %s", inst.Name)
+				}
+				continue
+			}
+			if uncordonErr := utils.UncordonNode(inst.Name, config); uncordonErr != nil {
+				logrus.WithError(uncordonErr).Errorf("can not uncordon node %s", inst.Name)
+			}
 		}
 	}
 }
 
 func getAddressDetails(ip string, region string, projectID string, config *cfg.Config) (types.IPAddress, error) {
-	hc, err := google.DefaultClient(context.Background(), container.CloudPlatformScope)
-	if err != nil {
-		logrus.Error(err)
-		return types.IPAddress{IP: "", Labels: map[string]string{}}, err
-	}
-	computeService, err := compute.New(hc)
+	computeService, err := getComputeService()
 	if err != nil {
 		logrus.Error(err)
 		return types.IPAddress{IP: "", Labels: map[string]string{}}, err
 	}
 	filter := "address=" + "\"" + ip + "\""
 
-	addresses, err := computeService.Addresses.List(projectID, region).Filter(filter).Do()
+	addresses, err := listAllAddresses(computeService, projectID, region, filter)
 	if err != nil {
 		logrus.Error(err)
 		return types.IPAddress{IP: "", Labels: map[string]string{}}, err
 	}
 
-	if len(addresses.Items) != 1 {
-		address := addresses.Items[0]
+	if len(addresses) == 1 {
+		address := addresses[0]
 		logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "getAddressDetails"}).Infof("Node ip is reserved %s %s", ip, fmt.Sprint(address.Labels))
 		return types.IPAddress{IP: address.Address, Labels: address.Labels}, nil
 	}
 
-	logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "getAddressDetails"}).Errorf("More than one address found %s", ip)
-	return types.IPAddress{IP: "", Labels: map[string]string{}}, fmt.Errorf("more than one address found for ip %s", ip)
+	logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "getAddressDetails"}).Errorf("%d addresses returned for ip %s", len(addresses), ip)
+	return types.IPAddress{IP: "", Labels: map[string]string{}}, fmt.Errorf("%d addresses returned for ip %s", len(addresses), ip)
 }
 
 func isAddressReserved(ip string, region string, projectID string, config *cfg.Config) bool {
-	hc, err := google.DefaultClient(context.Background(), container.CloudPlatformScope)
-	if err != nil {
-		logrus.Error(err)
-		return false
-	}
-	computeService, err := compute.New(hc)
+	computeService, err := getComputeService()
 	if err != nil {
 		logrus.Error(err)
 		return false
 	}
 	filter := "address=" + "\"" + ip + "\""
-	addresses, err := computeService.Addresses.List(projectID, region).Filter(filter).Do()
+	addresses, err := listAllAddresses(computeService, projectID, region, filter)
 	if err != nil {
 		logrus.Error(err)
 		return false
 	}
 
-	if len(addresses.Items) != 0 {
+	if len(addresses) != 0 {
 		logrus.WithFields(logrus.Fields{"pkg": "kubeip", "function": "isAddressReserved"}).Infof("Node ip is reserved %s", ip)
 		return true
 	}
@@ -405,13 +539,9 @@ func isAddressReserved(ip string, region string, projectID string, config *cfg.C
 
 // AddTagIfMissing add GKE node tag if missing
 func AddTagIfMissing(projectID string, instance string, zone string, config *cfg.Config) {
-	hc, err := google.DefaultClient(context.Background(), container.CloudPlatformScope)
+	computeService, err := getComputeService()
 	if err != nil {
 		logrus.Fatalf("Could not get authenticated client: %v", err)
-		return
-	}
-	computeService, err := compute.New(hc)
-	if err != nil {
 		return
 	}
 	inst, err := computeService.Instances.Get(projectID, zone, instance).Do()
